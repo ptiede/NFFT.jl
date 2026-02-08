@@ -3,7 +3,7 @@ module NFFTReactantExt
 using NFFT, NFFT.AbstractNFFTs
 using NFFT: NFFTParams, 
             initParams, getWindow, shiftNodes!, checkNodes, TENSOR,
-            precomputeWindowHatInvLUT, precompWindowHatInvLUT
+            precomputeWindowHatInvLUT, precompWindowHatInvLUT, precomputePolyInterp
 using LinearAlgebra
 using AbstractFFTs
 using Reactant
