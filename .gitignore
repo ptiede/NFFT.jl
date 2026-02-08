@@ -16,3 +16,4 @@ benchmark/img/*.svg
 benchmark/data/
 benchmark/img/
 Manifest.toml
+.vscode/settings.json

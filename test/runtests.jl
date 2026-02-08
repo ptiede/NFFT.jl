@@ -28,5 +28,6 @@ arrayTypes = areTypesDefined ? arrayTypes : [JLArray]
   # If types were defined we only run GPU related tests
   else
     include("gpu.jl")
+    include("reactant/reactant.jl")
   end
 end
