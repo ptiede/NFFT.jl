@@ -29,7 +29,7 @@ mutable struct Reactant_NFFTPlan{T<:Number, D, K<:AbstractMatrix, WT<:AbstractAr
     windowHatInvLUT::WH
 end
 
-
+# TODO figure out Adjoint Ancestor indices issue
 struct AdjointRPlan{P}
     plan::P
 end
