@@ -7,7 +7,7 @@ using NFFT: NFFTParams,
 using LinearAlgebra
 using AbstractFFTs
 using Reactant
-using Reactant: TracedRArray, TracedRNumber, TraceMode, traced_type_inner
+using Reactant: TracedRArray, TracedRNumber, TraceMode, traced_type_inner, @allowscalar
 using ReactantCore: @trace
 
 include("implementation.jl")

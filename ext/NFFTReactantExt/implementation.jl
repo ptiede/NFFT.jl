@@ -251,7 +251,7 @@ function AbstractNFFTs.convolve!(
     return fHat
 end
 
-# 1D convolution - vectorized sum over window
+# 1D convolution - vectorized gather and sum
 function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,1}, g, fHat) where {T}
     @allowscalar @trace for j in 1:p.J
         idx = p.windowIndices[:, 1, j]
@@ -261,9 +261,9 @@ function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,1}, g, fHat) where {T}
     return fHat
 end
 
-# 2D convolution - vectorized over window
+# 2D convolution - vectorized gather and sum
 function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, g, fHat) where {T}
-    @allowscalar@trace for j in 1:p.J
+    @allowscalar @trace for j in 1:p.J
         idx1 = p.windowIndices[:, 1, j]
         idx2 = p.windowIndices[:, 2, j]
         win1 = p.windowTensor[:, 1, j]
@@ -274,9 +274,9 @@ function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, g, fHat) where {T}
     return fHat
 end
 
-# 3D convolution - vectorized over window
+# 3D convolution - vectorized gather and sum
 function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,3}, g, fHat) where {T}
-    @allowscalar@trace for j in 1:p.J
+    @allowscalar @trace for j in 1:p.J
         idx1 = p.windowIndices[:, 1, j]
         idx2 = p.windowIndices[:, 2, j]
         idx3 = p.windowIndices[:, 3, j]
@@ -304,17 +304,17 @@ function AbstractNFFTs.convolve_transpose!(
     return g
 end
 
-# 1D convolution transpose - scatter with broadcasting
+# 1D convolution transpose - vectorized scatter
 function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,1}, fHat, g) where {T}
     @allowscalar @trace for j in 1:p.J
         idx = p.windowIndices[:, 1, j]
         win = p.windowTensor[:, 1, j]
-        g[idx] = g[idx] .+ win .* fHat[j]
+        g[idx] += win .* fHat[j]
     end
     return g
 end
 
-# 2D convolution transpose - scatter with broadcasting
+# 2D convolution transpose - vectorized scatter
 function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, fHat, g) where {T}
     @allowscalar @trace for j in 1:p.J
         idx1 = p.windowIndices[:, 1, j]
@@ -322,12 +322,12 @@ function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, fHat, g)
         win1 = p.windowTensor[:, 1, j]
         win2 = p.windowTensor[:, 2, j]
         # Outer product of windows times scalar
-        g[idx1, idx2] = g[idx1, idx2] .+ (win1 .* transpose(win2)) .* fHat[j]
+        g[idx1, idx2] += (win1 .* transpose(win2)) .* fHat[j]
     end
     return g
 end
 
-# 3D convolution transpose - scatter with broadcasting
+# 3D convolution transpose - vectorized scatter
 function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,3}, fHat, g) where {T}
     @allowscalar @trace for j in 1:p.J
         idx1 = p.windowIndices[:, 1, j]
@@ -338,7 +338,7 @@ function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,3}, fHat, g)
         win3 = p.windowTensor[:, 3, j]
         # 3D outer product of windows
         win_3d = reshape(win1, :, 1, 1) .* reshape(win2, 1, :, 1) .* reshape(win3, 1, 1, :)
-        g[idx1, idx2, idx3] = g[idx1, idx2, idx3] .+ win_3d .* fHat[j]
+        g[idx1, idx2, idx3] +=  win_3d .* fHat[j]
     end
     return g
 end
