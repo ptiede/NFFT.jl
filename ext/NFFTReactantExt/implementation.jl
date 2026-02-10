@@ -6,13 +6,13 @@ which stores precomputed window function values for each node.
 Supports D=1,2,3 dimensions.
 
 The plan stores:
-- Precomputed window tensor: (2m, D, J) array of window function values
-- Precomputed indices: (2m, D, J) array of wrapped indices for each node
+- Precomputed window tensor: (2m, D, J) array of window function values  
+- Precomputed linear indices for gather/scatter operations
 - Precomputed deconvolution LUT and indices
 
 Note: NFFTParams is NOT stored to avoid Reactant tracing issues with non-traceable fields.
 """
-mutable struct Reactant_NFFTPlan{T<:Number, D, K<:AbstractMatrix, WT<:AbstractArray{<:Any,3}, WI<:AbstractArray{<:Any,3}, DI<:AbstractVector, WH<:AbstractVector} <: AbstractNFFTPlan{T,D,1}
+mutable struct Reactant_NFFTPlan{T<:Number, D, M, K, WT, WI, WP, DI, WH} <: AbstractNFFTPlan{T,D,1}
     N::NTuple{D,Int64}
     NOut::NTuple{1,Int64}
     J::Int64
@@ -21,15 +21,20 @@ mutable struct Reactant_NFFTPlan{T<:Number, D, K<:AbstractMatrix, WT<:AbstractAr
     dims::UnitRange{Int64}
     # Precomputed window tensor: (2m, D, J) - window values for each node
     windowTensor::WT
-    # Precomputed indices: (2m, D, J) - wrapped indices for each dimension and node
-    windowIndices::WI
+    # Precomputed linear indices: (2m^D, J) - linear indices into flattened grid for each node
+    # This allows using a single gather/scatter per node
+    linearIndices::WI
+    # Precomputed window product: (2m^D, J) - product of separable windows for each node
+    windowProduct::WP
     # Deconvolution indices: linear indices mapping input to oversampled grid
     deconvolveIdx::DI
     # Flat deconvolution LUT: product of separable window hat inverse
     windowHatInvLUT::WH
 end
 
-# TODO figure out Adjoint Ancestor indices issue
+# Access M (window width 2m) as compile-time constant
+@inline window_width(::Reactant_NFFTPlan{T,D,M}) where {T,D,M} = M
+
 struct AdjointRPlan{P}
     plan::P
 end
@@ -65,8 +70,11 @@ function Reactant_NFFTPlan(k::AbstractMatrix{T}, N::NTuple{D,Int}; dims::Union{I
         error("Reactant NFFT does not support directional transforms yet!")
     end
     
-    # Precompute window tensor and indices (returns RArrays)
-    windowTensor, windowIndices = precompute_window_tensor_reactant(k, Ñ, params)
+    m = params.m
+    M = 2m  # window width
+    
+    # Precompute window tensor, linear indices, and window products
+    windowTensor, linearIndices, windowProduct = precompute_window_tensor_reactant(k, Ñ, params)
     
     # Precompute deconvolution LUT and indices (returns RArrays)
     deconvolveIdx, windowHatInvLUT = precompute_deconvolve_reactant(N, Ñ, params)
@@ -74,9 +82,9 @@ function Reactant_NFFTPlan(k::AbstractMatrix{T}, N::NTuple{D,Int}; dims::Union{I
     # Convert k to RArray as well
     k_r = Reactant.to_rarray(collect(k))
     
-    return Reactant_NFFTPlan{T, D, typeof(k_r), typeof(windowTensor), typeof(windowIndices), typeof(deconvolveIdx), typeof(windowHatInvLUT)}(
+    return Reactant_NFFTPlan{T, D, M, typeof(k_r), typeof(windowTensor), typeof(linearIndices), typeof(windowProduct), typeof(deconvolveIdx), typeof(windowHatInvLUT)}(
         N, NOut, J, k_r, Ñ, dims_,
-        windowTensor, windowIndices, deconvolveIdx, windowHatInvLUT
+        windowTensor, linearIndices, windowProduct, deconvolveIdx, windowHatInvLUT
     )
 end
 
@@ -85,44 +93,41 @@ AbstractNFFTs.size_out(p::Reactant_NFFTPlan) = p.NOut
 AbstractNFFTs.size_out(p::AdjointRPlan) = AbstractNFFTs.size_in(p.plan)
 AbstractNFFTs.size_in(p::AdjointRPlan) = AbstractNFFTs.size_out(p.plan)
 
-function Base.show(io::IO, p::Reactant_NFFTPlan{T,D}) where {T,D}
-    print(io, "Reactant_NFFTPlan with $(p.J) sampling points for $(D)D input of size $(p.N)")
+function Base.show(io::IO, p::Reactant_NFFTPlan{T,D,M}) where {T,D,M}
+    print(io, "Reactant_NFFTPlan with $(p.J) sampling points for $(D)D input of size $(p.N), window=$(M)")
 end
 
 #############################
 # Reactant tracing support
-# Only array fields should be traced; N, NOut, J, Ñ, dims remain constants
+# The plan is passed as Const - arrays inside are already RArrays
 #############################
 
-# Tell Reactant the traced type should keep T, D unchanged and trace the array type parameters
+# Tell Reactant to treat the plan as a constant structure with traced array fields
 Base.@nospecializeinfer function Reactant.traced_type_inner(
-    @nospecialize(RT::Type{<:Reactant_NFFTPlan{T,D}}),
+    @nospecialize(RT::Type{<:Reactant_NFFTPlan{T,D,M,K,WT,WI,WP,DI,WH}}),
     seen,
     mode::TraceMode,
     @nospecialize(track_numbers::Type),
     @nospecialize(ndevices),
     @nospecialize(runtime)
-) where {T,D}
-    # T and D are constant type parameters
-    # Only trace the array type parameters (K, WT, WI, DI, WH)
-    K2 = traced_type_inner(RT.parameters[3], seen, mode, track_numbers, ndevices, runtime)
-    WT2 = traced_type_inner(RT.parameters[4], seen, mode, track_numbers, ndevices, runtime)
-    WI2 = traced_type_inner(RT.parameters[5], seen, mode, track_numbers, ndevices, runtime)
-    DI2 = traced_type_inner(RT.parameters[6], seen, mode, track_numbers, ndevices, runtime)
-    WH2 = traced_type_inner(RT.parameters[7], seen, mode, track_numbers, ndevices, runtime)
-    return Reactant_NFFTPlan{T, D, K2, WT2, WI2, DI2, WH2}
+) where {T,D,M,K,WT,WI,WP,DI,WH}
+    K2 = traced_type_inner(K, seen, mode, track_numbers, ndevices, runtime)
+    WT2 = traced_type_inner(WT, seen, mode, track_numbers, ndevices, runtime)
+    WI2 = traced_type_inner(WI, seen, mode, track_numbers, ndevices, runtime)
+    WP2 = traced_type_inner(WP, seen, mode, track_numbers, ndevices, runtime)
+    DI2 = traced_type_inner(DI, seen, mode, track_numbers, ndevices, runtime)
+    WH2 = traced_type_inner(WH, seen, mode, track_numbers, ndevices, runtime)
+    return Reactant_NFFTPlan{T, D, M, K2, WT2, WI2, WP2, DI2, WH2}
 end
 
-# Custom make_tracer to only trace array fields, keeping scalars/tuples constant
 Base.@nospecializeinfer function Reactant.make_tracer(
     seen,
-    prev::Reactant_NFFTPlan{T,D},
+    prev::Reactant_NFFTPlan{T,D,M},
     @nospecialize(path),
     mode;
     kwargs...
-) where {T,D}
+) where {T,D,M}
     if mode == Reactant.TracedToTypes
-        # Just register that we visited this type
         push!(path, Core.Typeof(prev))
         return nothing
     end
@@ -131,24 +136,16 @@ Base.@nospecializeinfer function Reactant.make_tracer(
         return seen[prev]
     end
     
-    # Only trace the array fields, keep scalar/tuple fields as constants
     k_traced = Reactant.make_tracer(seen, prev.k, (path..., :k), mode; kwargs...)
     wt_traced = Reactant.make_tracer(seen, prev.windowTensor, (path..., :windowTensor), mode; kwargs...)
-    wi_traced = Reactant.make_tracer(seen, prev.windowIndices, (path..., :windowIndices), mode; kwargs...)
+    li_traced = Reactant.make_tracer(seen, prev.linearIndices, (path..., :linearIndices), mode; kwargs...)
+    wp_traced = Reactant.make_tracer(seen, prev.windowProduct, (path..., :windowProduct), mode; kwargs...)
     di_traced = Reactant.make_tracer(seen, prev.deconvolveIdx, (path..., :deconvolveIdx), mode; kwargs...)
     wh_traced = Reactant.make_tracer(seen, prev.windowHatInvLUT, (path..., :windowHatInvLUT), mode; kwargs...)
     
-    result = Reactant_NFFTPlan{T, D, typeof(k_traced), typeof(wt_traced), typeof(wi_traced), typeof(di_traced), typeof(wh_traced)}(
-        prev.N,      # constant - not traced
-        prev.NOut,   # constant - not traced
-        prev.J,      # constant - not traced
-        k_traced,
-        prev.Ñ,      # constant - not traced
-        prev.dims,   # constant - not traced
-        wt_traced,
-        wi_traced,
-        di_traced,
-        wh_traced
+    result = Reactant_NFFTPlan{T, D, M, typeof(k_traced), typeof(wt_traced), typeof(li_traced), typeof(wp_traced), typeof(di_traced), typeof(wh_traced)}(
+        prev.N, prev.NOut, prev.J, k_traced, prev.Ñ, prev.dims,
+        wt_traced, li_traced, wp_traced, di_traced, wh_traced
     )
     seen[prev] = result
     return result
@@ -159,60 +156,77 @@ end
 #############################
 
 """
-Precompute window tensor and wrapped indices for TENSOR mode.
-Uses NFFT's existing polynomial interpolation, then converts to RArrays.
+Precompute window tensor, linear indices, and window products.
 Returns:
-- windowTensor: (2m, D, J) array of window function values
-- windowIndices: (2m, D, J) array of wrapped indices
+- windowTensor: (2m, D, J) array of window function values (separable)
+- linearIndices: (2m^D, J) array of linear indices into flattened Ñ grid
+- windowProduct: (2m^D, J) array of window products (outer product of separable windows)
 """
 function precompute_window_tensor_reactant(k::AbstractMatrix{T}, Ñ::NTuple{D,Int}, params) where {T,D}
     m = params.m
     σ = params.σ
     J = size(k, 2)
-    m2 = 2m
+    M = 2m
     
     win, _ = getWindow(params.window)
-    
-    # Use NFFT's existing polynomial interpolation
     P = precomputePolyInterp(win, m, σ, T)
     
-    windowTensor = zeros(T, m2, D, J)
-    windowIndices = zeros(Int64, m2, D, J)
+    # Separable window tensor
+    windowTensor = zeros(T, M, D, J)
     
-    # Shift nodes to [0, 1) - work on a copy
-    kShifted = collect(k)  # ensure it's a regular Array for mutation
+    # For each node, compute M^D linear indices and window products
+    numStencil = M^D
+    linearIndices = zeros(Int64, numStencil, J)
+    windowProduct = zeros(T, numStencil, J)
+    
+    # Shift nodes to [0, 1)
+    kShifted = collect(k)
     shiftNodes!(kShifted)
-    itrD = 1:D
-    itrm = 1:m2
-    itrJ = 1:J
-    @trace for j in itrJ
-        @trace for d in itrD
+    
+    # Precompute strides for linear indexing
+    strides = ntuple(d -> d == 1 ? 1 : prod(Ñ[1:d-1]), D)
+    
+    for j in 1:J
+        # Compute separable window values and base indices for each dimension
+        offsets = Vector{Int}(undef, D)
+        for d in 1:D
             xtmp = kShifted[d, j]
             kscale = xtmp * Ñ[d]
             off = unsafe_trunc(Int, kscale) - m + 1
+            offsets[d] = off
             
-            # Compute polynomial evaluation point (same as NFFT._precomputeWindowTensor)
             k_ = kscale - off - m + 1 - T(0.5)
-            
-            @trace for l in itrm
-                # Store wrapped index (1-based)
-                windowIndices[l, d, j] = mod(off + l - 1, Ñ[d]) + 1
-                
-                # Compute window value using polynomial interpolation
+            for l in 1:M
                 windowTensor[l, d, j] = evalpoly(k_, ntuple(g -> P[g, l], size(P, 1)))
             end
         end
+        
+        # Compute all M^D combinations of indices and window products
+        for (idx, ci) in enumerate(CartesianIndices(ntuple(_ -> 1:M, D)))
+            # Compute linear index with wrapping
+            linIdx = 1
+            winProd = one(T)
+            for d in 1:D
+                l = ci[d]
+                wrapped = mod(offsets[d] + l - 1, Ñ[d])  # 0-based wrapped index
+                linIdx += wrapped * strides[d]
+                winProd *= windowTensor[l, d, j]
+            end
+            linearIndices[idx, j] = linIdx
+            windowProduct[idx, j] = winProd
+        end
     end
     
-    # Convert to RArrays for Reactant tracing
+    # Convert to RArrays
     windowTensor_r = Reactant.to_rarray(windowTensor)
-    windowIndices_r = Reactant.to_rarray(windowIndices)
+    linearIndices_r = Reactant.to_rarray(linearIndices)
+    windowProduct_r = Reactant.to_rarray(windowProduct)
     
-    return windowTensor_r, windowIndices_r
+    return windowTensor_r, linearIndices_r, windowProduct_r
 end
 
 """
-Precompute deconvolution lookup table and indices using NFFT's existing functions.
+Precompute deconvolution lookup table and indices.
 """
 function precompute_deconvolve_reactant(N::NTuple{D,Int}, Ñ::NTuple{D,Int}, params) where {D}
     T = eltype(params.σ)
@@ -221,17 +235,13 @@ function precompute_deconvolve_reactant(N::NTuple{D,Int}, Ñ::NTuple{D,Int}, par
     
     _, win_hat = getWindow(params.window)
     
-    # Use NFFT's existing function to compute separable LUTs
     windowHatInvLUT_sep = Vector{Vector{T}}(undef, D)
     precomputeWindowHatInvLUT(windowHatInvLUT_sep, win_hat, N, Ñ, m, σ, T)
     
-    # Use NFFT's existing function to compute flat LUT and indices
     windowHatInvLUT, deconvolveIdx = precompWindowHatInvLUT(params, N, Ñ, windowHatInvLUT_sep)
     
-    # Convert to real (NFFT returns Complex but values are real for deconvolution)
     windowHatInvLUT_real = real.(windowHatInvLUT)
     
-    # Convert to RArrays for Reactant tracing
     deconvolveIdx_r = Reactant.to_rarray(deconvolveIdx)
     windowHatInvLUT_r = Reactant.to_rarray(windowHatInvLUT_real)
     
@@ -240,6 +250,7 @@ end
 
 #############################
 # Convolution (forward: g -> fHat)
+# Uses batched gather - single operation instead of loop
 #############################
 
 function AbstractNFFTs.convolve!(
@@ -247,51 +258,17 @@ function AbstractNFFTs.convolve!(
     g::AbstractArray{<:Number, D},
     fHat::AbstractVector{<:Number},
 ) where {T,D}
-    convolve_tensor_reactant!(p, g, fHat)
-    return fHat
-end
-
-# 1D convolution - vectorized gather and sum
-function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,1}, g, fHat) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx = p.windowIndices[:, 1, j]
-        win = p.windowTensor[:, 1, j]
-        fHat[j] = sum(win .* g[idx])
-    end
-    return fHat
-end
-
-# 2D convolution - vectorized gather and sum
-function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, g, fHat) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx1 = p.windowIndices[:, 1, j]
-        idx2 = p.windowIndices[:, 2, j]
-        win1 = p.windowTensor[:, 1, j]
-        win2 = p.windowTensor[:, 2, j]
-        # Outer product of windows times gathered subgrid
-        fHat[j] = sum(win1 .* (transpose(win2) .* g[idx1, idx2]))
-    end
-    return fHat
-end
-
-# 3D convolution - vectorized gather and sum
-function convolve_tensor_reactant!(p::Reactant_NFFTPlan{T,3}, g, fHat) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx1 = p.windowIndices[:, 1, j]
-        idx2 = p.windowIndices[:, 2, j]
-        idx3 = p.windowIndices[:, 3, j]
-        win1 = p.windowTensor[:, 1, j]
-        win2 = p.windowTensor[:, 2, j]
-        win3 = p.windowTensor[:, 3, j]
-        # 3D outer product of windows
-        win_3d = reshape(win1, :, 1, 1) .* reshape(win2, 1, :, 1) .* reshape(win3, 1, 1, :)
-        fHat[j] = sum(win_3d .* g[idx1, idx2, idx3])
-    end
+    # Batched gather: g[linearIndices] gives (M^D, J) array
+    # Then multiply by windowProduct and sum over first dimension
+    gathered = g[p.linearIndices]  # (M^D, J)
+    weighted = gathered .* p.windowProduct  # (M^D, J)
+    fHat .= vec(sum(weighted, dims=1))  # (J,)
     return fHat
 end
 
 #############################
 # Convolution transpose (adjoint: fHat -> g)
+# Uses single scatter-add via Reactant.Ops.scatter
 #############################
 
 function AbstractNFFTs.convolve_transpose!(
@@ -300,46 +277,41 @@ function AbstractNFFTs.convolve_transpose!(
     g::AbstractArray{<:Number, D},
 ) where {T,D}
     g .= zero(eltype(g))
-    convolve_transpose_tensor_reactant!(p, fHat, g)
-    return g
-end
-
-# 1D convolution transpose - vectorized scatter
-function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,1}, fHat, g) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx = p.windowIndices[:, 1, j]
-        win = p.windowTensor[:, 1, j]
-        g[idx] += win .* fHat[j]
-    end
-    return g
-end
-
-# 2D convolution transpose - vectorized scatter
-function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,2}, fHat, g) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx1 = p.windowIndices[:, 1, j]
-        idx2 = p.windowIndices[:, 2, j]
-        win1 = p.windowTensor[:, 1, j]
-        win2 = p.windowTensor[:, 2, j]
-        # Outer product of windows times scalar
-        g[idx1, idx2] += (win1 .* transpose(win2)) .* fHat[j]
-    end
-    return g
-end
-
-# 3D convolution transpose - vectorized scatter
-function convolve_transpose_tensor_reactant!(p::Reactant_NFFTPlan{T,3}, fHat, g) where {T}
-    @allowscalar @trace for j in 1:p.J
-        idx1 = p.windowIndices[:, 1, j]
-        idx2 = p.windowIndices[:, 2, j]
-        idx3 = p.windowIndices[:, 3, j]
-        win1 = p.windowTensor[:, 1, j]
-        win2 = p.windowTensor[:, 2, j]
-        win3 = p.windowTensor[:, 3, j]
-        # 3D outer product of windows
-        win_3d = reshape(win1, :, 1, 1) .* reshape(win2, 1, :, 1) .* reshape(win3, 1, 1, :)
-        g[idx1, idx2, idx3] +=  win_3d .* fHat[j]
-    end
+    
+    # Compute all contributions: windowProduct .* fHat' gives (M^D, J)
+    # where fHat is broadcast across rows
+    contributions = p.windowProduct .* transpose(fHat)  # (M^D, J)
+    
+    # Flatten to 1D for scatter
+    flat_indices = vec(p.linearIndices)  # (M^D * J,)
+    flat_contributions = vec(contributions)  # (M^D * J,)
+    
+    # Reshape to (1, M^D * J) for scatter indices format (index_vector_dim=1 means each row is an index vector)
+    scatter_indices = reshape(flat_indices, 1, length(flat_indices))
+    
+    # Get flattened g as TracedRArray
+    g_flat = Reactant.promote_to(Reactant.TracedRArray, vec(g))
+    updates = Reactant.promote_to(Reactant.TracedRArray, flat_contributions)
+    idx = Reactant.promote_to(Reactant.TracedRArray{Int64, 2}, scatter_indices)
+    
+    #TODO it would be great if Reactant could raise this
+    # Use single scatter-add: scatter all contributions at once
+    result = Reactant.Ops.scatter(
+        +,  # add operation
+        [g_flat],
+        idx,
+        [updates];
+        update_window_dims=Int64[],
+        inserted_window_dims=Int64[1],
+        input_batching_dims=Int64[],
+        scatter_indices_batching_dims=Int64[],
+        scatter_dims_to_operand_dims=Int64[1],
+        index_vector_dim=1,
+    )[1]
+    
+    # Reshape back and copy to g
+    g .= reshape(result, size(g))
+    
     return g
 end
 
@@ -352,8 +324,8 @@ function AbstractNFFTs.deconvolve!(
     f::AbstractArray{<:Number, D},
     g::AbstractArray{<:Number, D}
 ) where {T,D}
-    # Broadcasting handles buffer donation automatically
-    g[p.deconvolveIdx] = vec(f) .* p.windowHatInvLUT
+    # Use direct linear indexing
+    g[p.deconvolveIdx] = f[1:length(p.windowHatInvLUT)] .* p.windowHatInvLUT
     return nothing
 end
 
@@ -366,8 +338,8 @@ function AbstractNFFTs.deconvolve_transpose!(
     g::AbstractArray{<:Number, D},
     f::AbstractArray{<:Number, D}
 ) where {T,D}
-    # Broadcasting handles buffer donation automatically
-    copyto!(f, reshape(g[p.deconvolveIdx] .* p.windowHatInvLUT, size(f)))
+    # Use direct linear indexing
+    f[1:length(p.windowHatInvLUT)] = g[p.deconvolveIdx] .* p.windowHatInvLUT
     return nothing
 end
 
@@ -375,9 +347,6 @@ end
 # mul! for forward and adjoint transforms
 #############################
 
-"""
-Forward NFFT: f -> fHat
-"""
 function LinearAlgebra.mul!(
     fHat::Reactant.AnyTracedRVector,
     p::Reactant_NFFTPlan{T,D},
@@ -387,15 +356,11 @@ function LinearAlgebra.mul!(
 ) where {T,D}
     NFFT.consistencyCheck(p, f, fHat)
     
-    # Create temp array for oversampled grid (zeros via broadcasting)
     g = similar(f, complex(eltype(f)), p.Ñ)
     g .= zero(eltype(g))
     
     t1 = @elapsed deconvolve!(p, f, g)
-    t2 = @elapsed begin
-        # In-place FFT using AbstractFFTs (works with Reactant)
-        fft!(g)
-    end
+    t2 = @elapsed fft!(g)
     t3 = @elapsed convolve!(p, g, fHat)
     
     if verbose
@@ -410,9 +375,6 @@ function LinearAlgebra.mul!(
     return fHat
 end
 
-"""
-Adjoint NFFT: fHat -> f
-"""
 function LinearAlgebra.mul!(
     f::Reactant.AnyTracedRArray,
     pl::AdjointRPlan,
@@ -423,15 +385,11 @@ function LinearAlgebra.mul!(
     p = pl.plan
     NFFT.consistencyCheck(p, f, fHat)
     
-    # Create temp array for oversampled grid (zeros via broadcasting)
     g = similar(f, complex(eltype(f)), p.Ñ)
     g .= zero(eltype(g))
     
     t1 = @elapsed convolve_transpose!(p, fHat, g)
-    t2 = @elapsed begin
-        # Backward FFT using AbstractFFTs (works with Reactant)
-        bfft!(g)
-    end
+    t2 = @elapsed bfft!(g)
     t3 = @elapsed deconvolve_transpose!(p, g, f)
     
     if verbose
@@ -447,21 +405,15 @@ function LinearAlgebra.mul!(
 end
 
 #############################
-# * operator for Reactant (looser type constraints than AbstractNFFTs)
+# * operator for Reactant
 #############################
 
-"""
-Forward NFFT via * operator: p * f -> fHat
-"""
 function Base.:*(p::Reactant_NFFTPlan{T,D}, f::Reactant.AnyTracedRArray; kargs...) where {T,D}
     fHat = similar(f, complex(eltype(f)), size_out(p))
     mul!(fHat, p, f; kargs...)
     return fHat
 end
 
-"""
-Adjoint NFFT via * operator: p' * fHat -> f
-"""
 function Base.:*(pl::AdjointRPlan, fHat::Reactant.AnyTracedRVector; kargs...)
     f = similar(fHat, complex(eltype(fHat)), size_out(pl))
     mul!(f, pl, fHat; kargs...)
