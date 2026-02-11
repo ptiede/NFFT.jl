@@ -12,15 +12,13 @@ The plan stores:
 
 Note: NFFTParams is NOT stored to avoid Reactant tracing issues with non-traceable fields.
 """
-mutable struct Reactant_NFFTPlan{T<:Number, D, M, K, WT, WI, WP, DI, WH} <: AbstractNFFTPlan{T,D,1}
+mutable struct Reactant_NFFTPlan{T<:Number, D, M, K, WI, WP, DI, WH} <: AbstractNFFTPlan{T,D,1}
     N::NTuple{D,Int64}
     NOut::NTuple{1,Int64}
     J::Int64
     k::K
     Ñ::NTuple{D,Int64}
     dims::UnitRange{Int64}
-    # Precomputed window tensor: (2m, D, J) - window values for each node
-    windowTensor::WT
     # Precomputed linear indices: (2m^D, J) - linear indices into flattened grid for each node
     # This allows using a single gather/scatter per node
     linearIndices::WI
@@ -74,7 +72,7 @@ function Reactant_NFFTPlan(k::AbstractMatrix{T}, N::NTuple{D,Int}; dims::Union{I
     M = 2m  # window width
     
     # Precompute window tensor, linear indices, and window products
-    windowTensor, linearIndices, windowProduct = precompute_window_tensor_reactant(k, Ñ, params)
+    linearIndices, windowProduct = precompute_window_tensor_reactant(k, Ñ, params)
     
     # Precompute deconvolution LUT and indices (returns RArrays)
     deconvolveIdx, windowHatInvLUT = precompute_deconvolve_reactant(N, Ñ, params)
@@ -82,9 +80,9 @@ function Reactant_NFFTPlan(k::AbstractMatrix{T}, N::NTuple{D,Int}; dims::Union{I
     # Convert k to RArray as well
     k_r = Reactant.to_rarray(collect(k))
     
-    return Reactant_NFFTPlan{T, D, M, typeof(k_r), typeof(windowTensor), typeof(linearIndices), typeof(windowProduct), typeof(deconvolveIdx), typeof(windowHatInvLUT)}(
+    return Reactant_NFFTPlan{T, D, M, typeof(k_r), typeof(linearIndices), typeof(windowProduct), typeof(deconvolveIdx), typeof(windowHatInvLUT)}(
         N, NOut, J, k_r, Ñ, dims_,
-        windowTensor, linearIndices, windowProduct, deconvolveIdx, windowHatInvLUT
+         linearIndices, windowProduct, deconvolveIdx, windowHatInvLUT
     )
 end
 
@@ -104,20 +102,19 @@ end
 
 # Tell Reactant to treat the plan as a constant structure with traced array fields
 Base.@nospecializeinfer function Reactant.traced_type_inner(
-    @nospecialize(RT::Type{<:Reactant_NFFTPlan{T,D,M,K,WT,WI,WP,DI,WH}}),
+    @nospecialize(RT::Type{<:Reactant_NFFTPlan{T,D,M,K,WI,WP,DI,WH}}),
     seen,
     mode::TraceMode,
     @nospecialize(track_numbers::Type),
     @nospecialize(ndevices),
     @nospecialize(runtime)
-) where {T,D,M,K,WT,WI,WP,DI,WH}
+) where {T,D,M,K,WI,WP,DI,WH}
     K2 = traced_type_inner(K, seen, mode, track_numbers, ndevices, runtime)
-    WT2 = traced_type_inner(WT, seen, mode, track_numbers, ndevices, runtime)
     WI2 = traced_type_inner(WI, seen, mode, track_numbers, ndevices, runtime)
     WP2 = traced_type_inner(WP, seen, mode, track_numbers, ndevices, runtime)
     DI2 = traced_type_inner(DI, seen, mode, track_numbers, ndevices, runtime)
     WH2 = traced_type_inner(WH, seen, mode, track_numbers, ndevices, runtime)
-    return Reactant_NFFTPlan{T, D, M, K2, WT2, WI2, WP2, DI2, WH2}
+    return Reactant_NFFTPlan{T, D, M, K2, WI2, WP2, DI2, WH2}
 end
 
 Base.@nospecializeinfer function Reactant.make_tracer(
@@ -137,15 +134,14 @@ Base.@nospecializeinfer function Reactant.make_tracer(
     end
     
     k_traced = Reactant.make_tracer(seen, prev.k, (path..., :k), mode; kwargs...)
-    wt_traced = Reactant.make_tracer(seen, prev.windowTensor, (path..., :windowTensor), mode; kwargs...)
     li_traced = Reactant.make_tracer(seen, prev.linearIndices, (path..., :linearIndices), mode; kwargs...)
     wp_traced = Reactant.make_tracer(seen, prev.windowProduct, (path..., :windowProduct), mode; kwargs...)
     di_traced = Reactant.make_tracer(seen, prev.deconvolveIdx, (path..., :deconvolveIdx), mode; kwargs...)
     wh_traced = Reactant.make_tracer(seen, prev.windowHatInvLUT, (path..., :windowHatInvLUT), mode; kwargs...)
     
-    result = Reactant_NFFTPlan{T, D, M, typeof(k_traced), typeof(wt_traced), typeof(li_traced), typeof(wp_traced), typeof(di_traced), typeof(wh_traced)}(
+    result = Reactant_NFFTPlan{T, D, M, typeof(k_traced), typeof(li_traced), typeof(wp_traced), typeof(di_traced), typeof(wh_traced)}(
         prev.N, prev.NOut, prev.J, k_traced, prev.Ñ, prev.dims,
-        wt_traced, li_traced, wp_traced, di_traced, wh_traced
+        li_traced, wp_traced, di_traced, wh_traced
     )
     seen[prev] = result
     return result
@@ -158,7 +154,6 @@ end
 """
 Precompute window tensor, linear indices, and window products.
 Returns:
-- windowTensor: (2m, D, J) array of window function values (separable)
 - linearIndices: (2m^D, J) array of linear indices into flattened Ñ grid
 - windowProduct: (2m^D, J) array of window products (outer product of separable windows)
 """
@@ -170,10 +165,7 @@ function precompute_window_tensor_reactant(k::AbstractMatrix{T}, Ñ::NTuple{D,In
     
     win, _ = getWindow(params.window)
     P = precomputePolyInterp(win, m, σ, T)
-    
-    # Separable window tensor
-    windowTensor = zeros(T, M, D, J)
-    
+        
     # For each node, compute M^D linear indices and window products
     numStencil = M^D
     linearIndices = zeros(Int64, numStencil, J)
@@ -187,20 +179,7 @@ function precompute_window_tensor_reactant(k::AbstractMatrix{T}, Ñ::NTuple{D,In
     strides = ntuple(d -> d == 1 ? 1 : prod(Ñ[1:d-1]), D)
     
     for j in 1:J
-        # Compute separable window values and base indices for each dimension
-        offsets = Vector{Int}(undef, D)
-        for d in 1:D
-            xtmp = kShifted[d, j]
-            kscale = xtmp * Ñ[d]
-            off = unsafe_trunc(Int, kscale) - m + 1
-            offsets[d] = off
-            
-            k_ = kscale - off - m + 1 - T(0.5)
-            for l in 1:M
-                windowTensor[l, d, j] = evalpoly(k_, ntuple(g -> P[g, l], size(P, 1)))
-            end
-        end
-        
+        # Compute separable window values and base indices for each dimension        
         # Compute all M^D combinations of indices and window products
         for (idx, ci) in enumerate(CartesianIndices(ntuple(_ -> 1:M, D)))
             # Compute linear index with wrapping
@@ -208,9 +187,15 @@ function precompute_window_tensor_reactant(k::AbstractMatrix{T}, Ñ::NTuple{D,In
             winProd = one(T)
             for d in 1:D
                 l = ci[d]
-                wrapped = mod(offsets[d] + l - 1, Ñ[d])  # 0-based wrapped index
+
+                xtmp = kShifted[d, j]
+                kscale = xtmp * Ñ[d]
+                off = unsafe_trunc(Int, kscale) - m + 1
+                k_ = kscale - off - m + 1 - T(0.5)
+
+                wrapped = mod(off + l - 1, Ñ[d])  # 0-based wrapped index
                 linIdx += wrapped * strides[d]
-                winProd *= windowTensor[l, d, j]
+                winProd *= evalpoly(k_, ntuple(g -> P[g, l], size(P, 1)))
             end
             linearIndices[idx, j] = linIdx
             windowProduct[idx, j] = winProd
@@ -218,11 +203,10 @@ function precompute_window_tensor_reactant(k::AbstractMatrix{T}, Ñ::NTuple{D,In
     end
     
     # Convert to RArrays
-    windowTensor_r = Reactant.to_rarray(windowTensor)
     linearIndices_r = Reactant.to_rarray(linearIndices)
     windowProduct_r = Reactant.to_rarray(windowProduct)
     
-    return windowTensor_r, linearIndices_r, windowProduct_r
+    return linearIndices_r, windowProduct_r
 end
 
 """
@@ -262,7 +246,7 @@ function AbstractNFFTs.convolve!(
     # Then multiply by windowProduct and sum over first dimension
     gathered = g[p.linearIndices]  # (M^D, J)
     weighted = gathered .* p.windowProduct  # (M^D, J)
-    fHat .= vec(sum(weighted, dims=1))  # (J,)
+    copyto!(fHat, vec(sum(weighted, dims=1)))  # (J,)
     return fHat
 end
 
@@ -310,7 +294,7 @@ function AbstractNFFTs.convolve_transpose!(
     )[1]
     
     # Reshape back and copy to g
-    g .= reshape(result, size(g))
+    copyto!(g, reshape(result, size(g)))
     
     return g
 end
