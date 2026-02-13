@@ -341,7 +341,7 @@ function LinearAlgebra.mul!(
     NFFT.consistencyCheck(p, f, fHat)
     
     g = similar(f, complex(eltype(f)), p.Ñ)
-    g .= zero(eltype(g))
+    fill!(g, zero(eltype(g)))
     
     t1 = @elapsed deconvolve!(p, f, g)
     t2 = @elapsed fft!(g)
@@ -370,7 +370,7 @@ function LinearAlgebra.mul!(
     NFFT.consistencyCheck(p, f, fHat)
     
     g = similar(f, complex(eltype(f)), p.Ñ)
-    g .= zero(eltype(g))
+    fill!(g, zero(eltype(g)))
     
     t1 = @elapsed convolve_transpose!(p, fHat, g)
     t2 = @elapsed bfft!(g)
